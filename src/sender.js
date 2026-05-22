@@ -4,11 +4,10 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 
 /**
  * Format ukuran file ke string yang mudah dibaca.
- * @param {number} bytes
- * @returns {string}
  */
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -18,78 +17,78 @@ function formatSize(bytes) {
 
 /**
  * Kirim video ke chat WhatsApp.
- * @param {Object} sock - Instance Baileys socket
- * @param {string} jid - JID tujuan (chat ID)
- * @param {string} videoPath - Path file video yang akan dikirim
- * @param {Object} info - Informasi tambahan untuk caption
- * @param {number} info.originalSize - Ukuran file asli (bytes)
- * @param {number} info.compressedSize - Ukuran file setelah kompres (bytes)
- * @param {Object} info.metadata - Metadata video (duration, dll)
- * @param {boolean} info.skipped - True jika kompres dilewati
- * @returns {Promise<void>}
  */
 async function sendVideo(sock, jid, videoPath, info = {}) {
   if (!fs.existsSync(videoPath)) {
     throw new Error(`File video tidak ditemukan: ${videoPath}`);
   }
 
+  const fileSize = fs.statSync(videoPath).size;
   const { originalSize, compressedSize, metadata = {}, skipped = false } = info;
 
-  // Buat caption informatif
-  const lines = ['🎵 *Video TikTok*'];
+  console.log(`[Sender] Mencoba kirim video ke ${jid}`);
+  console.log(`[Sender] File: ${path.basename(videoPath)} (${formatSize(fileSize)})`);
 
-  if (metadata.durationFormatted) {
-    lines.push(`⏱️ Durasi: ${metadata.durationFormatted}`);
+  // Validasi ukuran — WhatsApp max ~64MB
+  const MAX_BYTES = 64 * 1024 * 1024;
+  if (fileSize > MAX_BYTES) {
+    throw new Error(`Video terlalu besar (${formatSize(fileSize)}). Maksimal 64MB untuk WhatsApp.`);
   }
 
+  // Buat caption
+  const lines = ['🎵 *Video TikTok*'];
+  if (metadata.durationFormatted) lines.push(`⏱️ Durasi: ${metadata.durationFormatted}`);
   if (originalSize && compressedSize) {
     if (!skipped) {
       const ratio = ((1 - compressedSize / originalSize) * 100).toFixed(0);
-      lines.push(`📦 Ukuran: ${formatSize(compressedSize)} _(dari ${formatSize(originalSize)}, hemat ${ratio}%)_`);
+      lines.push(`📦 Ukuran: ${formatSize(compressedSize)} _(hemat ${ratio}%)_`);
     } else {
       lines.push(`📦 Ukuran: ${formatSize(compressedSize)}`);
     }
   }
-
   lines.push('');
   lines.push('_Powered by Bot WA TikTok Downloader_ 🤖');
-
   const caption = lines.join('\n');
 
-  // Kirim video
-  await sock.sendMessage(jid, {
-    video: fs.readFileSync(videoPath),
-    caption,
-    mimetype: 'video/mp4',
-  });
+  // Kirim menggunakan { url } approach (lebih stabil untuk file besar)
+  const videoUrl = 'file://' + videoPath;
 
-  console.log(`[Sender] ✅ Video terkirim ke ${jid}`);
+  try {
+    const result = await sock.sendMessage(jid, {
+      video: { url: videoUrl },
+      caption,
+      mimetype: 'video/mp4',
+      fileLength: fileSize,
+      ptv: false, // Pastikan bukan video-note/circle
+    });
+
+    if (result) {
+      console.log(`[Sender] ✅ Video terkirim! Message ID: ${result.key?.id}`);
+    } else {
+      console.warn(`[Sender] ⚠️ sendMessage selesai tapi result null/undefined`);
+    }
+  } catch (sendErr) {
+    console.error(`[Sender] ❌ Gagal kirim video: ${sendErr.message}`);
+    throw sendErr;
+  }
 }
 
 /**
  * Kirim pesan teks biasa.
- * @param {Object} sock
- * @param {string} jid
- * @param {string} text
- * @param {Object} [options] - { quoted: message } untuk reply
  */
 async function sendText(sock, jid, text, options = {}) {
-  const msgContent = { text };
-  const sendOptions = {};
-
-  if (options.quoted) {
-    sendOptions.quoted = options.quoted;
+  try {
+    const msgContent = { text };
+    const sendOptions = {};
+    if (options.quoted) sendOptions.quoted = options.quoted;
+    await sock.sendMessage(jid, msgContent, sendOptions);
+  } catch (err) {
+    console.error(`[Sender] ❌ Gagal kirim teks: ${err.message}`);
   }
-
-  await sock.sendMessage(jid, msgContent, sendOptions);
 }
 
 /**
  * Kirim reaksi emoji ke pesan.
- * @param {Object} sock
- * @param {string} jid
- * @param {Object} message - Pesan yang akan diberi reaksi
- * @param {string} emoji - Emoji reaksi
  */
 async function sendReaction(sock, jid, message, emoji) {
   try {

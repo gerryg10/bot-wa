@@ -44,6 +44,12 @@ async function downloadWithYtDlp(url) {
   const outputPath = generateTempFilename('mp4');
   const ytdlp = getYtDlpPath();
 
+  // Gunakan cookies.txt jika tersedia (untuk bypass login TikTok)
+  const cookiesPath = path.join(process.cwd(), 'cookies.txt');
+  const cookiesArgs = fs.existsSync(cookiesPath)
+    ? ['--cookies', cookiesPath]
+    : [];
+
   const args = [
     url,
     '--no-warnings',
@@ -54,6 +60,7 @@ async function downloadWithYtDlp(url) {
     '--extractor-args', 'tiktok:app_name=trill',
     '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     '--socket-timeout', '30',
+    ...cookiesArgs,
   ];
 
   const timeout = parseInt(process.env.DOWNLOAD_TIMEOUT_SEC || '120') * 1000;

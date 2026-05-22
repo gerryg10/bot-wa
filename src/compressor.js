@@ -114,8 +114,10 @@ async function compressVideo(inputPath) {
       .outputOptions([
         '-preset fast',
         '-movflags +faststart', // Streaming-friendly
-        '-crf 28',             // Constant Rate Factor (kualitas)
-        '-pix_fmt yuv420p',    // Kompatibilitas maksimal
+        '-crf 28',              // Constant Rate Factor (kualitas)
+        '-pix_fmt yuv420p',     // Kompatibilitas maksimal
+        '-profile:v baseline',  // WhatsApp compatibility (H.264 Baseline)
+        '-level 3.1',           // Kompatibel luas di semua device
       ]);
 
     // Scale ke max 720p jika perlu
