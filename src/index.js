@@ -5,7 +5,7 @@
 
 require('dotenv').config();
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
@@ -40,8 +40,13 @@ async function startBot() {
   // Load session - SAMA PERSIS dengan bot.js lama
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
+  // Fetch versi WA terbaru (WAJIB agar tidak kena 405 rejection)
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`[Init] WA version: ${version.join('.')} ${isLatest ? '(latest)' : ''}`);
+
   // Config socket - IDENTIK dengan bot.js lama yang terbukti jalan
   const sock = makeWASocket({
+    version,
     auth: state,
     logger: pino({ level: 'silent' }),
     browser: ['Ubuntu', 'Chrome', '20.0.04'],
