@@ -50,12 +50,13 @@ async function sendVideo(sock, jid, videoPath, info = {}) {
   lines.push('_Powered by Bot WA TikTok Downloader_ 🤖');
   const caption = lines.join('\n');
 
-  // Kirim menggunakan { url } approach (lebih stabil untuk file besar)
-  const videoUrl = 'file://' + videoPath;
+  // Baca file ke buffer lalu kirim
+  const videoBuffer = fs.readFileSync(videoPath);
+  console.log(`[Sender] Buffer size: ${formatSize(videoBuffer.length)}`);
 
   try {
     const result = await sock.sendMessage(jid, {
-      video: { url: videoUrl },
+      video: videoBuffer,
       caption,
       mimetype: 'video/mp4',
       fileLength: fileSize,
