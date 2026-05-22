@@ -60,6 +60,23 @@ async function handleMessage(sock, message) {
       return; // Abaikan tipe pesan lain
     }
 
+    const trimmed = msgText.trim().toLowerCase();
+    console.log(`[Handler] 📥 Pesan masuk dari ${jid} | type: ${msgType} | isi: "${msgText.slice(0, 80)}"`);
+
+    // ── Command /test & /ping ─────────────────────────────────────────────
+    if (trimmed === '/test' || trimmed === '/ping') {
+      console.log(`[Handler] 🔧 Command ${trimmed} dari ${jid}`);
+      try {
+        const res = await sock.sendMessage(jid, {
+          text: `✅ *Bot Aktif!*\n\n🤖 Bot WA TikTok Downloader\n📱 JID kamu: ${jid}\n⏱️ Server time: ${new Date().toISOString()}\n\nKirim link TikTok untuk download video!`,
+        }, { quoted: message });
+        console.log(`[Handler] ✅ Reply /test berhasil! MsgID: ${res?.key?.id}`);
+      } catch (e) {
+        console.error(`[Handler] ❌ Gagal reply /test: ${e.message}`);
+      }
+      return;
+    }
+
     // Cek apakah ada link TikTok
     const tiktokUrl = extractTikTokUrl(msgText);
     if (!tiktokUrl) return;
