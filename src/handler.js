@@ -1,178 +1,387 @@
 /**
  * handler.js
- * Handler utama untuk memproses pesan masuk dari WhatsApp.
- * Flow: Deteksi link TikTok → Download → Kompres → Kirim
+ * Handler utama - gabungan command lama + fitur TikTok downloader.
  */
 
+const axios = require('axios');
+const fs = require('fs');
 const { extractTikTokUrl } = require('./detector');
 const { downloadTikTok, cleanupFile } = require('./downloader');
 const { compressVideo } = require('./compressor');
-const { sendVideo, sendText, sendReaction } = require('./sender');
-const fs = require('fs');
+const { sendVideo } = require('./sender');
 
-// Anti-flood: tracking user yang sedang dalam proses
+// ── Database XP (dari bot lama) ───────────────────────────────────────────────
+let database = { userXP: {} };
+if (fs.existsSync('./database.json')) {
+  database = JSON.parse(fs.readFileSync('./database.json'));
+}
+const saveData = () => fs.writeFileSync('./database.json', JSON.stringify(database, null, 2));
+const getLevel = (xp) => {
+  if (xp >= 4000) return 'Mythical Immortal';
+  if (xp >= 1500) return 'Mythical Glory';
+  if (xp >= 1200) return 'Mythical Honor';
+  if (xp >= 800)  return 'Mythic';
+  if (xp >= 600)  return 'Legend';
+  if (xp >= 400)  return 'Epic';
+  if (xp >= 200)  return 'Grand Master';
+  if (xp >= 100)  return 'Master';
+  if (xp >= 50)   return 'Elite';
+  if (xp >= 10)   return 'Warrior';
+  return 'No Rank';
+};
+
+// ── State Games ───────────────────────────────────────────────────────────────
+let balapAyam = {};
+let mathGame = {};
+
+// ── Anti-flood TikTok ─────────────────────────────────────────────────────────
 const processingUsers = new Set();
-// Cooldown per user (ms)
-const USER_COOLDOWN_MS = 15000; // 15 detik
+const USER_COOLDOWN_MS = 15000;
 const userLastRequest = new Map();
 
-/**
- * Cek apakah user sedang dalam cooldown.
- * @param {string} userId
- * @returns {number} Sisa cooldown dalam detik (0 jika tidak ada)
- */
 function checkCooldown(userId) {
   const lastTime = userLastRequest.get(userId);
   if (!lastTime) return 0;
   const elapsed = Date.now() - lastTime;
-  if (elapsed < USER_COOLDOWN_MS) {
-    return Math.ceil((USER_COOLDOWN_MS - elapsed) / 1000);
-  }
+  if (elapsed < USER_COOLDOWN_MS) return Math.ceil((USER_COOLDOWN_MS - elapsed) / 1000);
   return 0;
 }
 
-/**
- * Handler utama pesan masuk.
- * @param {Object} sock - Baileys socket instance
- * @param {Object} message - Object pesan dari Baileys
- */
-async function handleMessage(sock, message) {
+// ── Handler Utama ─────────────────────────────────────────────────────────────
+async function handleMessage(sock, msg) {
   try {
-    // Ambil data pesan
-    const jid = message.key.remoteJid;
-    const isFromMe = message.key.fromMe;
-    const msgType = Object.keys(message.message || {})[0];
-
-    // Abaikan pesan dari bot sendiri
-    if (isFromMe) return;
-    // Abaikan pesan sistem/protokol
-    if (!msgType || msgType === 'protocolMessage' || msgType === 'senderKeyDistributionMessage') return;
+    const from = msg.key.remoteJid;
+    const isGroup = from.endsWith('@g.us');
+    const sender = msg.key.participant || msg.key.remoteJid;
+    const userNumber = sender.split('@')[0];
+    const pushname = msg.pushName || 'Member';
 
     // Ekstrak teks pesan
-    let msgText = '';
-    if (msgType === 'conversation') {
-      msgText = message.message.conversation;
-    } else if (msgType === 'extendedTextMessage') {
-      msgText = message.message.extendedTextMessage?.text || '';
-    } else if (msgType === 'imageMessage') {
-      msgText = message.message.imageMessage?.caption || '';
-    } else {
-      return; // Abaikan tipe pesan lain
+    const body = (
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      msg.message.imageMessage?.caption || ''
+    ).trim();
+
+    const command = body.toLowerCase();
+
+    console.log(`[Handler] 📥 Dari: ${from} | Pesan: "${body.slice(0, 80)}"`);
+
+    // ── XP Tracker ─────────────────────────────────────────────────────────
+    if (!database.userXP[sender]) database.userXP[sender] = { xp: 0, level: 'No Rank' };
+    const oldLevel = getLevel(database.userXP[sender].xp);
+    database.userXP[sender].xp += 1;
+    saveData();
+    const newLevel = getLevel(database.userXP[sender].xp);
+    if (newLevel !== oldLevel) {
+      await sock.sendMessage(from, {
+        text: `🎉 *RANK UP!* 🎉\n\nCongrats! @${userNumber}\nRank kamu naik: *${oldLevel}* ➡️ *${newLevel}*\nTotal XP: *${database.userXP[sender].xp}*`,
+        mentions: [sender],
+      });
     }
 
-    const trimmed = msgText.trim().toLowerCase();
-    console.log(`[Handler] 📥 Pesan masuk dari ${jid} | type: ${msgType} | isi: "${msgText.slice(0, 80)}"`);
+    // ═══════════════════════════════════════════════════════════════════════
+    // COMMAND LAMA (BACKUP)
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // ── Command /test & /ping ─────────────────────────────────────────────
-    if (trimmed === '/test' || trimmed === '/ping') {
-      console.log(`[Handler] 🔧 Command ${trimmed} dari ${jid}`);
+    // ── /test & /ping ───────────────────────────────────────────────────────
+    if (command === '/test' || command === '/ping') {
+      const res = await sock.sendMessage(from, {
+        text: `✅ *Bot Aktif!*\n\n🤖 Bot WA TikTok Downloader\n📱 JID: ${from}\n⏱️ Server time: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`,
+      }, { quoted: msg });
+      console.log(`[Handler] ✅ /test berhasil MsgID: ${res?.key?.id}`);
+      return;
+    }
+
+    // ── /help & /menu ───────────────────────────────────────────────────────
+    if (command === '/help' || command === '/menu') {
+      const runtime = process.uptime();
+      const hours = Math.floor(runtime / 3600);
+      const minutes = Math.floor((runtime % 3600) / 60);
+      const menuTeks = `───「 *Bot WA TikTok Downloader* 」───
+
+*INFO BOT*
+❒ *Runtime:* ${hours}h ${minutes}m
+❒ *Prefix:* / (Slash)
+❒ *Status:* Active
+
+*🎵 TIKTOK*
+❒ Kirim link TikTok → bot download & kompres otomatis
+❒ Format: vt.tiktok.com / vm.tiktok.com / www.tiktok.com/@.../video/...
+
+*🎮 GAMES*
+❒ */suit [batu/gunting/kertas]* - Suit vs Bot
+❒ */math* - Soal matematika (+10 XP)
+❒ */typingfast* - Balapan ngetik
+
+*📊 RANKING*
+❒ */rank* - Cek rank & XP kamu
+❒ */leaderboard* atau */lb* - Top 10
+
+*🛠️ INFO*
+❒ */device* - Cek jenis device
+❒ */roll* - Roll dadu 1-100
+❒ */quotes* - Quotes random
+❒ */infogempa* - Info gempa BMKG
+❒ *@botstatus* - Uptime bot
+❒ */vngoogle [teks]* - Voice note TTS
+
+*ADMIN ONLY*
+❒ */admin* - List admin grup
+────────────────────────────────`.trim();
+      await sock.sendMessage(from, { text: menuTeks }, { quoted: msg });
+      return;
+    }
+
+    // ── /rank ───────────────────────────────────────────────────────────────
+    if (command === '/rank') {
+      const userData = database.userXP[sender] || { xp: 0 };
+      const currentLevel = getLevel(userData.xp);
+      await sock.sendMessage(from, {
+        text: `📊 *USER RANKING* 📊\n\n👤 Nama: *${pushname}*\n✨ Total XP: *${userData.xp}*\n🎖️ Level: *${currentLevel}*`,
+        mentions: [sender],
+      }, { quoted: msg });
+      return;
+    }
+
+    // ── /leaderboard ────────────────────────────────────────────────────────
+    if (command === '/leaderboard' || command === '/lb') {
+      const users = Object.keys(database.userXP);
+      if (users.length === 0) return await sock.sendMessage(from, { text: 'Belum ada data di Leaderboard!' });
+      const sorted = users.sort((a, b) => database.userXP[b].xp - database.userXP[a].xp);
+      const top10 = sorted.slice(0, 10);
+      let teks = `🏆 *TOP 10 LEADERBOARD XP* 🏆\n\n`;
+      top10.forEach((jid, i) => {
+        const userXP = database.userXP[jid].xp;
+        const userLevel = getLevel(userXP);
+        const num = jid.split('@')[0];
+        const emoji = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '👤';
+        teks += `${emoji} *${i + 1}.* @${num}\n   └  *XP:* ${userXP} | *Rank:* ${userLevel}\n\n`;
+      });
+      teks += `_Tetaplah aktif untuk naik ke puncak!_`;
+      await sock.sendMessage(from, { text: teks, mentions: top10 });
+      return;
+    }
+
+    // ── /roll ───────────────────────────────────────────────────────────────
+    if (command === '/roll') {
+      const hasil = Math.floor(Math.random() * 100) + 1;
+      await sock.sendMessage(from, { text: `🎲 Result: *${hasil}*` }, { quoted: msg });
+      return;
+    }
+
+    // ── /quotes ─────────────────────────────────────────────────────────────
+    if (command === '/quotes') {
+      const daftarQuotes = [
+        'Hiduplah seolah kamu mati besok. Belajarlah seolah kamu hidup selamanya. — Mahatma Gandhi',
+        'Usaha tidak akan mengkhianati hasil. — Anonim',
+        'Jangan berhenti ketika lelah, berhentilah ketika kamu sudah selesai. — David Goggins',
+        'Waktu adalah pedang. — Al-Imam Ash-Shafi\'i',
+        'Kesuksesan bukan kunci kebahagiaan. Kebahagiaanlah kunci kesuksesan. — Albert Schweitzer',
+        'Sakit dalam perjuangan itu hanya sementara. — Lance Armstrong',
+        'Orang yang berhenti belajar akan menjadi pemilik masa lalu. — Eric Hoffer',
+      ];
+      const q = daftarQuotes[Math.floor(Math.random() * daftarQuotes.length)];
+      const parts = q.split(' — ');
+      await sock.sendMessage(from, { text: `_"${parts[0]}"_\n\n— *${parts[1]}*` }, { quoted: msg });
+      return;
+    }
+
+    // ── /device ─────────────────────────────────────────────────────────────
+    if (command === '/device') {
+      const msgId = msg.key.id;
+      const deviceType = msgId.length > 21 ? 'Android / iPhone' : msgId.length < 21 ? 'WhatsApp Web' : 'Desktop / Tablet';
+      await sock.sendMessage(from, { text: `You use device: *${deviceType}*` }, { quoted: msg });
+      return;
+    }
+
+    // ── @botstatus ──────────────────────────────────────────────────────────
+    if (command === '@botstatus') {
+      const uptime = process.uptime();
+      const h = Math.floor(uptime / 3600);
+      const m = Math.floor((uptime % 3600) / 60);
+      const s = Math.floor(uptime % 60);
+      await sock.sendMessage(from, { text: `Bot sudah aktif selama: *${h} jam, ${m} menit, ${s} detik*` });
+      return;
+    }
+
+    // ── /infogempa ──────────────────────────────────────────────────────────
+    if (command === '/infogempa') {
       try {
-        const res = await sock.sendMessage(jid, {
-          text: `✅ *Bot Aktif!*\n\n🤖 Bot WA TikTok Downloader\n📱 JID kamu: ${jid}\n⏱️ Server time: ${new Date().toISOString()}\n\nKirim link TikTok untuk download video!`,
-        }, { quoted: message });
-        console.log(`[Handler] ✅ Reply /test berhasil! MsgID: ${res?.key?.id}`);
+        const res = await axios.get('https://data.bmkg.go.id/DataMKG/TEWS/autogempa.json');
+        const gempa = res.data.Infogempa.gempa;
+        const teks = `🚨 *INFO GEMPA TERKINI*\n\n📅 Tanggal: ${gempa.Tanggal}\n⌚ Waktu: ${gempa.Jam}\n📏 Magnitudo: ${gempa.Magnitude}\n📍 Lokasi: ${gempa.Wilayah}\n🌊 Potensi: ${gempa.Potensi}\n🧭 Koordinat: ${gempa.Coordinates}`;
+        await sock.sendMessage(from, { text: teks }, { quoted: msg });
       } catch (e) {
-        console.error(`[Handler] ❌ Gagal reply /test: ${e.message}`);
+        await sock.sendMessage(from, { text: 'Gagal mengambil data BMKG.' });
       }
       return;
     }
 
-    // Cek apakah ada link TikTok
-    const tiktokUrl = extractTikTokUrl(msgText);
+    // ── /vngoogle ───────────────────────────────────────────────────────────
+    if (body.startsWith('/vngoogle')) {
+      const teks = body.replace(/^\/vngoogle/i, '').trim();
+      if (!teks) return await sock.sendMessage(from, { text: 'Contoh: */vngoogle Halo semuanya*' }, { quoted: msg });
+      try {
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(teks)}&tl=id&client=tw-ob`;
+        await sock.sendMessage(from, { audio: { url }, mimetype: 'audio/mp4', ptt: true }, { quoted: msg });
+      } catch (e) {
+        await sock.sendMessage(from, { text: `Gagal: ${e.message}` });
+      }
+      return;
+    }
+
+    // ── /suit ───────────────────────────────────────────────────────────────
+    if (command.startsWith('/suit')) {
+      const pilihanUser = command.split(' ')[1];
+      const pilihanBot = ['batu', 'gunting', 'kertas'][Math.floor(Math.random() * 3)];
+      if (!['batu', 'gunting', 'kertas'].includes(pilihanUser)) {
+        return await sock.sendMessage(from, { text: 'Cara main: */suit batu*, */suit gunting*, atau */suit kertas*' });
+      }
+      let hasil;
+      if (pilihanUser === pilihanBot) {
+        hasil = '🤝 *SERI!*';
+      } else if (
+        (pilihanUser === 'batu' && pilihanBot === 'gunting') ||
+        (pilihanUser === 'gunting' && pilihanBot === 'kertas') ||
+        (pilihanUser === 'kertas' && pilihanBot === 'batu')
+      ) {
+        database.userXP[sender].xp += 10; saveData();
+        hasil = `🥳 *MENANG!*\nKamu: ${pilihanUser} | Bot: ${pilihanBot}\n\n+10 XP`;
+      } else {
+        database.userXP[sender].xp -= 2; saveData();
+        hasil = `💀 *KALAH!*\nKamu: ${pilihanUser} | Bot: ${pilihanBot}\n\n-2 XP`;
+      }
+      await sock.sendMessage(from, { text: hasil }, { quoted: msg });
+      return;
+    }
+
+    // ── /math ───────────────────────────────────────────────────────────────
+    if (command === '/math') {
+      if (mathGame[from]) return await sock.sendMessage(from, { text: 'Masih ada soal yang belum terjawab!' });
+      const ops = ['+', '-', 'x'];
+      const op = ops[Math.floor(Math.random() * ops.length)];
+      let a, b, hasil;
+      if (op === 'x') { a = Math.floor(Math.random() * 30) + 1; b = Math.floor(Math.random() * 10) + 1; hasil = a * b; }
+      else if (op === '+') { a = Math.floor(Math.random() * 300) + 1; b = Math.floor(Math.random() * 300) + 1; hasil = a + b; }
+      else { a = Math.floor(Math.random() * 300) + 1; b = Math.floor(Math.random() * a) + 1; hasil = a - b; }
+      mathGame[from] = hasil;
+      await sock.sendMessage(from, { text: `🧮 *MATH CHALLENGE* 🧮\n\nBerapakah hasil dari:\n*${a} ${op} ${b}* = ...?` }, { quoted: msg });
+      return;
+    }
+
+    // ── Cek jawaban math ────────────────────────────────────────────────────
+    if (!isNaN(body) && body !== '' && mathGame[from] !== undefined) {
+      if (parseInt(body) === mathGame[from]) {
+        database.userXP[sender].xp += 10; saveData();
+        await sock.sendMessage(from, {
+          text: `✅ *BENAR!* @${userNumber}\nJawabannya: *${mathGame[from]}*\n\n*+10 XP* ✨`,
+          mentions: [sender],
+        }, { quoted: msg });
+        delete mathGame[from];
+      }
+      return;
+    }
+
+    // ── /typingfast ─────────────────────────────────────────────────────────
+    if (command === '/typingfast') {
+      if (balapAyam[from]) return await sock.sendMessage(from, { text: 'Masih ada balapan yang berlangsung!' });
+      balapAyam[from] = true;
+      await sock.sendMessage(from, { text: '🏁 *Cepet cepetan ngetik* 🏁\n\nSiapa yang paling cepat mengetik:\n*Pneumonoultramicroscopicsilicovolcanoconiosis*\n\n3... 2... 1... *GO!!!*' });
+      return;
+    }
+    if (body === 'Pneumonoultramicroscopicsilicovolcanoconiosis' && balapAyam[from]) {
+      delete balapAyam[from];
+      await sock.sendMessage(from, { text: `🏆 *JUARA 1:* @${userNumber}\nCongrats! faster 💨`, mentions: [sender] }, { quoted: msg });
+      return;
+    }
+
+    // ── /admin (group only) ─────────────────────────────────────────────────
+    if (command === '/admin' && isGroup) {
+      const metadata = await sock.groupMetadata(from);
+      const admins = metadata.participants.filter(v => v.admin !== null).map(v => v.id);
+      const isAdmin = metadata.participants.find(v => v.id === sender)?.admin !== null;
+      if (!isAdmin) return await sock.sendMessage(from, { text: 'Command ini hanya untuk admin.' });
+      let teks = '*Admin di Group ini:*\n\n';
+      for (let admin of admins) teks += `- @${admin.split('@')[0]}\n`;
+      await sock.sendMessage(from, { text: teks, mentions: admins });
+      return;
+    }
+
+    // ── p (ping sederhana) ──────────────────────────────────────────────────
+    if (command === 'p') {
+      await sock.sendMessage(from, { text: 'kenapa?' });
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FITUR TIKTOK DOWNLOADER
+    // ═══════════════════════════════════════════════════════════════════════
+    const tiktokUrl = extractTikTokUrl(body);
     if (!tiktokUrl) return;
 
-    console.log(`[Handler] 📩 Link TikTok diterima dari ${jid}: ${tiktokUrl}`);
+    console.log(`[Handler] 🎵 Link TikTok dari ${from}: ${tiktokUrl}`);
 
-    // Identifikasi pengirim
-    const senderId = message.key.participant || jid;
-
-    // Anti-flood: cek cooldown
-    const cooldownSec = checkCooldown(senderId);
-    if (cooldownSec > 0) {
-      await sendText(sock, jid,
-        `⏳ Tunggu ${cooldownSec} detik lagi sebelum request berikutnya.`,
-        { quoted: message }
-      );
+    // Anti-flood
+    const senderId = msg.key.participant || from;
+    const cooldown = checkCooldown(senderId);
+    if (cooldown > 0) {
+      await sock.sendMessage(from, { text: `⏳ Tunggu ${cooldown} detik lagi.` }, { quoted: msg });
       return;
     }
-
-    // Anti-flood: cek apakah user sedang diproses
     if (processingUsers.has(senderId)) {
-      await sendText(sock, jid,
-        `⚙️ Request sebelumnya masih diproses. Sabar ya!`,
-        { quoted: message }
-      );
+      await sock.sendMessage(from, { text: '⚙️ Request sebelumnya masih diproses.' }, { quoted: msg });
       return;
     }
 
-    // Tandai user sedang diproses
     processingUsers.add(senderId);
     userLastRequest.set(senderId, Date.now());
 
-    // Kirim reaksi ⏳ sebagai tanda proses dimulai
-    await sendReaction(sock, jid, message, '⏳');
-
-    // Kirim pesan loading
-    await sendText(sock, jid,
-      `⬇️ Sedang mengunduh video TikTok...\n_Mohon tunggu sebentar_`,
-      { quoted: message }
-    );
+    // Reaksi loading
+    try { await sock.sendMessage(from, { react: { text: '⏳', key: msg.key } }); } catch (_) {}
+    await sock.sendMessage(from, { text: '⬇️ Sedang mengunduh video TikTok...\n_Mohon tunggu sebentar_' }, { quoted: msg });
 
     let downloadResult = null;
     let compressResult = null;
 
     try {
-      // ===== STEP 1: DOWNLOAD =====
+      // Download
       downloadResult = await downloadTikTok(tiktokUrl);
-      console.log(`[Handler] ✅ Download selesai: ${downloadResult.filePath}`);
+      console.log(`[Handler] ✅ Download selesai`);
 
-      // ===== STEP 2: KOMPRES =====
-      await sendText(sock, jid, `🔄 Sedang mengompresi video...`);
+      // Kompres
+      await sock.sendMessage(from, { text: '🔄 Sedang mengompresi video...' });
       compressResult = await compressVideo(downloadResult.filePath);
-      console.log(`[Handler] ✅ Kompres selesai: ${compressResult.outputPath}`);
+      console.log(`[Handler] ✅ Kompres selesai`);
 
-      // Hapus file download asli jika sudah dikompres ke file baru
       if (!compressResult.skipped && compressResult.outputPath !== downloadResult.filePath) {
         cleanupFile(downloadResult.filePath);
       }
 
-      // ===== STEP 3: KIRIM VIDEO =====
-      await sendVideo(sock, jid, compressResult.outputPath, {
+      // Kirim video
+      await sendVideo(sock, from, compressResult.outputPath, {
         originalSize: compressResult.originalSize,
         compressedSize: compressResult.compressedSize,
         metadata: compressResult.metadata,
         skipped: compressResult.skipped,
       });
 
-      // Reaksi sukses
-      await sendReaction(sock, jid, message, '✅');
+      try { await sock.sendMessage(from, { react: { text: '✅', key: msg.key } }); } catch (_) {}
 
-    } catch (processErr) {
-      console.error(`[Handler] ❌ Error saat proses: ${processErr.message}`);
-
-      // Kirim pesan error ke user
-      await sendText(sock, jid,
-        `❌ *Gagal memproses video*\n\n${processErr.message}\n\n_Pastikan link TikTok valid dan coba lagi._`,
-        { quoted: message }
-      );
-
-      // Reaksi error
-      await sendReaction(sock, jid, message, '❌');
-
+    } catch (err) {
+      console.error(`[Handler] ❌ Error TikTok: ${err.message}`);
+      await sock.sendMessage(from, { text: `❌ *Gagal memproses video*\n\n${err.message}\n\n_Coba lagi nanti._` }, { quoted: msg });
+      try { await sock.sendMessage(from, { react: { text: '❌', key: msg.key } }); } catch (_) {}
     } finally {
-      // Bersihkan semua file temp
       if (downloadResult?.filePath) cleanupFile(downloadResult.filePath);
       if (compressResult?.outputPath && compressResult.outputPath !== downloadResult?.filePath) {
         cleanupFile(compressResult.outputPath);
       }
-
-      // Hapus dari tracking
       processingUsers.delete(senderId);
     }
 
   } catch (err) {
     console.error(`[Handler] ❌ Unexpected error: ${err.message}`);
-    console.error(err.stack);
   }
 }
 
