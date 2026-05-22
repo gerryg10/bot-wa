@@ -13,6 +13,8 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   isJidBroadcast,
+  makeInMemoryStore,
+  jidNormalizedUser,
 } = require('@whiskeysockets/baileys');
 
 const pino = require('pino');
@@ -41,6 +43,9 @@ const logger = pino({
   level: process.env.DEBUG === 'true' ? 'debug' : 'silent',
 });
 
+// ── In-memory message store (diperlukan Baileys untuk retry/receipt) ───────────
+const store = makeInMemoryStore({ logger });
+
 // ── Fungsi Utama ──────────────────────────────────────────────────────────────
 let reconnectAttempts = 0;
 
@@ -67,12 +72,24 @@ async function startBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
-    printQRInTerminal: false, // Kita handle QR sendiri
-    browser: ['Bot TikTok', 'Chrome', '120.0.0'],
+    printQRInTerminal: false,
+    browser: ['Ubuntu', 'Chrome', '120.0.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
+    defaultQueryTimeoutMs: 60000,
+    // Diperlukan agar Baileys bisa retry pesan yang gagal deliver
+    getMessage: async (key) => {
+      if (store) {
+        const msg = await store.loadMessage(key.remoteJid, key.id);
+        return msg?.message || undefined;
+      }
+      return { conversation: '' };
+    },
   });
+
+  // Bind store ke socket events
+  store?.bind(sock.ev);
 
   // ── Event: Connection Update ─────────────────────────────────────────────
   sock.ev.on('connection.update', async (update) => {
